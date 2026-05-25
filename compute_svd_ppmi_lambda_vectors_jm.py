@@ -1,49 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created in February 2020
+Rishika Goswami
+goswami.rishika67@gmail.com
 
-Modified February 2025:
-- Incorporated NLTK for tokenization and stopword removal.
-- Automatic download of missing 'punkt_tab'.
-- Replaced Dirichlet smoothing with Jelinek–Mercer smoothing in the PMI weighting.
-  For each cell (w,c) the smoothed count is computed as:
-      new_count = (1 - jm_lambda) * count(w,c) + jm_lambda * (count(w) * count(c) / N)
-  and then PMI is given by:
-      PMI(w,c) = log( (new_count * N) / (count(w)*count(c)) )
-  
-Based on:
-Jungmaier/Kassner/Roth (2020): "Dirichlet-Smoothed Word Embeddings for Low-Resource Settings"
-and
-Jelinek–Mercer smoothing as described in:
-https://sigir.org/wp-content/uploads/2017/06/p268.pdf
+Builds word embeddings from a raw text corpus using PPMI, SVD, and
+Jelinek-Mercer smoothing. The script writes word2vec-style vectors for
+downstream word-similarity evaluation.
 """
 
 import argparse
 import math
-import numpy as np
+import os
 import random
 import re
+from collections import defaultdict
+from functools import lru_cache
+
 import nltk
-
-###############################################################################
-# BEGIN NLTK punkt_tab fix
-###############################################################################
-try:
-    nltk.data.find('tokenizers/punkt_tab')
-except LookupError:
-    nltk.download('punkt_tab')
-###############################################################################
-# END NLTK punkt_tab fix
-###############################################################################
-
+import numpy as np
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
-from collections import defaultdict
-from scipy.sparse import csr_matrix, dok_matrix
-from sklearn.utils.extmath import randomized_svd
+from scipy.sparse import coo_matrix, csr_matrix
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import normalize
+from sklearn.utils.extmath import randomized_svd
+
+
+def ensure_nltk_resources():
+    """Download the small tokenizer/stopword resources if they are missing."""
+    resources = (
+        ('tokenizers/punkt', 'punkt'),
+        ('tokenizers/punkt_tab', 'punkt_tab'),
+        ('corpora/stopwords', 'stopwords'),
+    )
+    for resource_path, package_name in resources:
+        try:
+            nltk.data.find(resource_path)
+        except LookupError:
+            nltk.download(package_name, quiet=True)
+
+
+@lru_cache(maxsize=1)
+def english_stopword_set():
+    return set(stopwords.words('english'))
+
+
+ensure_nltk_resources()
 
 
 def clean_and_filter_tokens(line):
@@ -56,34 +59,23 @@ def clean_and_filter_tokens(line):
     """
     tokens = []
     raw_tokens = word_tokenize(line)
-    for t in raw_tokens:
-        t_lower = t.lower()
-        # Skip tokens without any alphabetic character.
-        if not re.search('[a-zA-Z]', t_lower):
+    for token in raw_tokens:
+        token_lower = token.lower()
+        if not re.search('[a-zA-Z]', token_lower):
             continue
-        # Skip stopwords.
-        if t_lower in stopwords.words('english'):
+        if token_lower in english_stopword_set():
             continue
-        tokens.append(t_lower)
+        tokens.append(token_lower)
     return tokens
 
 
 def file_to_cooc_matrix(file_name, chunk_size=3000000, window_size=5,
                         min_count=1, subsampling_rate=0.00001, verbose=True):
     """
-    Reads a text corpus file (one raw text line per line) and returns a sparse
-    co-occurrence matrix. It:
-      - Tokenizes each line (using NLTK).
-      - Removes stopwords.
-      - Lowercases tokens.
-      - Applies a sliding window to count co-occurrences.
-    
-    Parameters:
-      chunk_size: approximate size in bytes per chunk (for memory management).
-      window_size: max distance from the “middle” word for context.
-      min_count: keep only words with frequency >= min_count.
-      subsampling_rate: frequent word downsampling (similar to word2vec).
-      verbose: print progress information.
+    Reads a text corpus file and returns a sparse co-occurrence matrix.
+
+    The corpus is tokenized with NLTK, lowercased, filtered for stopwords, and
+    then converted into sliding-window co-occurrence counts.
     """
     word_count = defaultdict(int)
 
@@ -92,31 +84,28 @@ def file_to_cooc_matrix(file_name, chunk_size=3000000, window_size=5,
 
     with open(file_name, encoding='utf-8') as corpus_file:
         chunks_total = 0
-        # First pass: count word frequencies.
         while True:
             text_chunk = corpus_file.readlines(chunk_size)
             if not text_chunk:
                 break
             chunks_total += 1
             for line in text_chunk:
-                tokens = clean_and_filter_tokens(line)
-                for token in tokens:
+                for token in clean_and_filter_tokens(line):
                     word_count[token] += 1
 
-        # Build vocabulary: only keep words with frequency >= min_count.
         vocab = [word for word, count in sorted(word_count.items(),
-                                                 key=lambda x: x[1],
-                                                 reverse=True)
+                                                key=lambda x: x[1],
+                                                reverse=True)
                  if count >= min_count]
         vocab_set = set(vocab)
 
-        # Prepare subsampling if requested.
         if subsampling_rate:
             corpus_size = sum(word_count.values())
             subsampling_threshold = subsampling_rate * corpus_size
             subsampling_dict = {
-                w: 1 - math.sqrt(subsampling_threshold / count)
-                for w, count in word_count.items() if count > subsampling_threshold
+                word: 1 - math.sqrt(subsampling_threshold / count)
+                for word, count in word_count.items()
+                if count > subsampling_threshold
             }
             rand = random.Random(0)
             if verbose:
@@ -129,10 +118,9 @@ def file_to_cooc_matrix(file_name, chunk_size=3000000, window_size=5,
             print(f"Vocabulary size (after min_count): {len(vocab)}")
             print("Building co-occurrence matrix...")
 
-        # Rewind file to beginning for the second pass.
         corpus_file.seek(0, 0)
-        word_to_id = {w: i for i, w in enumerate(vocab)}
-        m = csr_matrix((len(vocab), len(vocab)), dtype=float)
+        word_to_id = {word: i for i, word in enumerate(vocab)}
+        matrix = csr_matrix((len(vocab), len(vocab)), dtype=float)
 
         chunk_count = 0
         while True:
@@ -148,13 +136,14 @@ def file_to_cooc_matrix(file_name, chunk_size=3000000, window_size=5,
 
             chunk_tokens = []
             for line in text_chunk:
-                tokens = clean_and_filter_tokens(line)
-                # Filter tokens to include only those in the final vocabulary.
-                tokens = [t for t in tokens if t in vocab_set]
-                # Apply subsampling if needed.
+                tokens = [token for token in clean_and_filter_tokens(line)
+                          if token in vocab_set]
                 if subsampling_rate:
-                    tokens = [t for t in tokens
-                              if (t not in subsampling_dict or rand.random() > subsampling_dict[t])]
+                    tokens = [
+                        token for token in tokens
+                        if (token not in subsampling_dict or
+                            rand.random() > subsampling_dict[token])
+                    ]
                 chunk_tokens.extend(tokens)
 
             row = []
@@ -168,42 +157,41 @@ def file_to_cooc_matrix(file_name, chunk_size=3000000, window_size=5,
                     if j == i:
                         continue
                     context_word = chunk_tokens[j]
-                    ctx_id = word_to_id[context_word]
                     row.append(mid_id)
-                    col.append(ctx_id)
+                    col.append(word_to_id[context_word])
                     data.append(1)
 
-            tmp_m = csr_matrix((data, (row, col)),
-                               shape=(len(vocab), len(vocab)), dtype=float)
-            m = m + tmp_m
+            chunk_matrix = csr_matrix((data, (row, col)),
+                                      shape=(len(vocab), len(vocab)),
+                                      dtype=float)
+            matrix = matrix + chunk_matrix
 
         if verbose:
-            print(f"Co-occurrence matrix shape: {m.shape[0]} x {m.shape[1]}")
-            print(f"Non-zero entries: {m.nnz}")
+            print(f"Co-occurrence matrix shape: {matrix.shape[0]} x {matrix.shape[1]}")
+            print(f"Non-zero entries: {matrix.nnz}")
 
-    return m, word_to_id
+    return matrix, word_to_id
 
 
-def save_word_vectors(file_name, word_vector_matrix, word_to_id, vocab, verbose=True):
+def save_word_vectors(file_name, word_vector_matrix, word_to_id, vocab,
+                      verbose=True):
     """
     Saves word vectors to a text file in word2vec format:
-       #(vectors)  #(dimensions)
+       #(vectors) #(dimensions)
        word1 dim1 dim2 dim3 ...
        word2 dim1 dim2 dim3 ...
-       ...
-    
-    Parameters:
-      file_name: name of output file.
-      word_vector_matrix: matrix containing word embeddings.
-      word_to_id: dictionary mapping words to row indices.
-      vocab: list of all words in the vocabulary (ordered).
-      verbose: if True, print progress information.
     """
     if verbose:
         print(f"Saving word vectors for {len(vocab)} words...")
 
+    output_dir = os.path.dirname(file_name)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     with open(file_name, "w", encoding='utf-8') as vector_file:
-        vector_file.write(f"{word_vector_matrix.shape[0]} {word_vector_matrix.shape[1]}\n")
+        vector_file.write(
+            f"{word_vector_matrix.shape[0]} {word_vector_matrix.shape[1]}\n"
+        )
         for i, word in enumerate(vocab, start=1):
             row_vec = word_vector_matrix[word_to_id[word], :]
             vector_file.write(word + " " + " ".join(map(str, row_vec)) + "\n")
@@ -216,29 +204,19 @@ def save_word_vectors(file_name, word_vector_matrix, word_to_id, vocab, verbose=
 
 def pmi_weight(cooc_matrix, jm_lambda=0.0, threshold=0, verbose=True):
     """
-    Computes the PMI (or PPMI) matrix with optional Jelinek–Mercer smoothing.
+    Computes the PMI or PPMI matrix with optional Jelinek-Mercer smoothing.
 
-    For each cell (w, c), the smoothed count is computed as:
-      new_count = (1 - jm_lambda) * count(w,c) + jm_lambda * (count(w) * count(c) / N)
-    and then the PMI is computed as:
-      PMI(w,c) = log((new_count * N) / (count(w) * count(c)))
-
-    Parameters:
-      cooc_matrix: sparse co-occurrence matrix (vocabulary x vocabulary).
-      jm_lambda: Jelinek–Mercer smoothing parameter (0 <= jm_lambda <= 1).
-                 When set to 0, no smoothing is applied.
-      threshold: if PMI values are below this threshold, they are set to 0.
-      verbose:   if True, prints progress information.
+    For each nonzero cell (w, c), the smoothed count is:
+      new_count = (1 - jm_lambda) * count(w,c)
+                  + jm_lambda * (count(w) * count(c) / N)
     """
     if verbose:
-        print("Computing PMI with Jelinek–Mercer smoothing:")
+        print("Computing PMI with Jelinek-Mercer smoothing:")
 
-    # Compute marginal counts for words and contexts.
-    row_counts = np.array(cooc_matrix.sum(axis=1))[:, 0]   # shape: (V,)
-    col_counts = np.array(cooc_matrix.sum(axis=0))[0, :]    # shape: (V,)
-    total_count = col_counts.sum()  # Total number of co-occurrences, N.
+    row_counts = np.array(cooc_matrix.sum(axis=1))[:, 0]
+    col_counts = np.array(cooc_matrix.sum(axis=0))[0, :]
+    total_count = col_counts.sum()
 
-    # Convert the co-occurrence matrix to COO (coordinate) format.
     cooc_coo = cooc_matrix.tocoo()
     rows = cooc_coo.row
     cols = cooc_coo.col
@@ -246,35 +224,40 @@ def pmi_weight(cooc_matrix, jm_lambda=0.0, threshold=0, verbose=True):
 
     if jm_lambda != 0:
         if verbose:
-            print(f"Applying Jelinek–Mercer smoothing with lambda = {jm_lambda}")
-        # Compute the smoothed count for each nonzero entry.
+            print(f"Applying Jelinek-Mercer smoothing with lambda = {jm_lambda}")
         smoothed_data = ((1 - jm_lambda) * original_data +
-                         jm_lambda * (row_counts[rows] * col_counts[cols] / total_count))
+                         jm_lambda * (row_counts[rows] *
+                                      col_counts[cols] / total_count))
     else:
         if verbose:
             print("No smoothing applied (jm_lambda = 0).")
         smoothed_data = original_data.copy()
 
-    # Compute PMI: PMI = log((smoothed_count * total_count) / (row_count * col_count))
-    pmi_values = np.log((smoothed_data * total_count) / (row_counts[rows] * col_counts[cols]))
+    pmi_values = np.log(
+        (smoothed_data * total_count) / (row_counts[rows] * col_counts[cols])
+    )
 
-    # Apply thresholding (e.g., for PPMI, set negative PMI to 0).
     if threshold is not None:
         if verbose:
             print(f"Applying threshold: PMI values below {threshold} are set to 0.")
         pmi_values[pmi_values < threshold] = 0
 
-    # Rebuild the sparse PMI matrix.
-    from scipy.sparse import coo_matrix
-    pmi_matrix = coo_matrix((pmi_values, (rows, cols)), shape=cooc_matrix.shape)
-    pmi_matrix = pmi_matrix.tocsr()
+    return coo_matrix((pmi_values, (rows, cols)), shape=cooc_matrix.shape).tocsr()
 
-    return pmi_matrix
+
+def svd_components(matrix, requested_dimensions, verbose=True):
+    max_components = min(matrix.shape)
+    if max_components < 1:
+        raise ValueError("The co-occurrence matrix is empty; check the corpus and min_count.")
+    components = min(requested_dimensions, max_components)
+    if verbose and components != requested_dimensions:
+        print(f"Using {components} SVD components because the matrix is {matrix.shape}.")
+    return components
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Calculates word embeddings from a corpus using PPMI, SVD, and Jelinek–Mercer smoothing."
+        description="Calculates word embeddings from a corpus using PPMI, SVD, and Jelinek-Mercer smoothing."
     )
     parser.add_argument("corpus_file",
                         help="Text file with raw text lines. Tokenization and stopword removal are done by NLTK.")
@@ -291,7 +274,7 @@ if __name__ == "__main__":
     parser.add_argument("--dimensions", "-d", type=int, default=100,
                         help="Embedding dimension (default: 100).")
     parser.add_argument("--jm_lambda", "-j", type=float, default=0.0,
-                        help="Jelinek–Mercer smoothing parameter (0 for no smoothing, typical values between 0 and 1).")
+                        help="Jelinek-Mercer smoothing parameter (0 for no smoothing, typical values between 0 and 1).")
     parser.add_argument("--threshold", "-t", type=float, default=0.0,
                         help="Threshold for PMI values (default: 0.0; negative values are set to 0).")
     parser.add_argument("--eigenvalue_weighting", "-e", type=float, default=0.0,
@@ -303,7 +286,6 @@ if __name__ == "__main__":
     if args.verbose:
         print(args)
 
-    # 1) Build the co-occurrence matrix.
     m, word_to_id = file_to_cooc_matrix(
         file_name=args.corpus_file,
         chunk_size=args.chunk_size,
@@ -314,7 +296,6 @@ if __name__ == "__main__":
     )
     vocab = list(word_to_id.keys())
 
-    # 2) Compute PMI with Jelinek–Mercer smoothing.
     m = pmi_weight(
         cooc_matrix=m,
         jm_lambda=args.jm_lambda,
@@ -322,35 +303,31 @@ if __name__ == "__main__":
         verbose=args.verbose
     )
 
-    # 3) Perform SVD to reduce dimensions.
+    dimensions = svd_components(m, args.dimensions, verbose=args.verbose)
+
     if args.verbose:
         print("Performing SVD...", end="\r")
 
     if args.eigenvalue_weighting == 1:
-        # Full SVD with singular values incorporated.
-        svd = TruncatedSVD(n_components=args.dimensions, random_state=0)
+        svd = TruncatedSVD(n_components=dimensions, random_state=0)
         m = svd.fit_transform(m)
     elif args.eigenvalue_weighting == 0:
-        # Standard truncated SVD (ignores singular values).
-        u, _, _ = randomized_svd(m, n_components=args.dimensions, random_state=0)
+        u, _, _ = randomized_svd(m, n_components=dimensions, random_state=0)
         m = u
     else:
-        # SVD with singular value weighting.
-        u, s, _ = randomized_svd(m, n_components=args.dimensions, random_state=0)
+        u, s, _ = randomized_svd(m, n_components=dimensions, random_state=0)
         sigma = np.diag(s ** args.eigenvalue_weighting)
         m = u.dot(sigma)
 
     if args.verbose:
         print("SVD complete.")
 
-    # 4) Normalize the word vectors.
     if args.verbose:
         print("Normalizing vectors...", end="\r")
     m = normalize(m, norm="l2", axis=1, copy=False)
     if args.verbose:
         print("Normalization complete.")
 
-    # 5) Save the embeddings.
     save_word_vectors(
         file_name=args.word_vector_filename,
         word_vector_matrix=m,

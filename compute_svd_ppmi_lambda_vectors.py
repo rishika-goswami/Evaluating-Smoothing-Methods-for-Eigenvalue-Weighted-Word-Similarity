@@ -1,40 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created in February 2020
+Rishika Goswami
+goswami.rishika67@gmail.com
 
-@author: Jakob Jungmaier
-
-Calculates word embeddings from corpus by using PPMI, SVD,
-and Dirichlet Smoothing. For more details cf. Jungmaier/Kassner/Roth(2020):
-"Dirichlet-Smoothed Word Embeddings for Low-Resource Settings"
-
-Modified February 2025:
-- Incorporated NLTK for tokenization and stopword removal.
-- Attempt to automatically download missing 'punkt_tab' if not found.
+Builds word embeddings from a raw text corpus using PPMI, SVD, and
+Dirichlet smoothing. The script writes word2vec-style vectors for downstream
+word-similarity evaluation.
 """
 
 import argparse
 import math
 import numpy as np
+import os
 import random
 import re
 import nltk
-###############################################################################
-# BEGIN NLTK punkt_tab fix
-###############################################################################
-# Explanation: Some NLTK releases require 'punkt_tab' for word_tokenize() or
-# related sentence tokenizers. If 'punkt_tab' is missing, you get:
-#   LookupError: Resource punkt_tab not found.
-# This code checks for its presence and downloads it if needed.
-try:
-    nltk.data.find('tokenizers/punkt_tab')
-except LookupError:
-    nltk.download('punkt_tab')
-###############################################################################
-# END NLTK punkt_tab fix
-###############################################################################
 
+from functools import lru_cache
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
 from collections import defaultdict
@@ -42,6 +25,28 @@ from scipy.sparse import csr_matrix, dok_matrix
 from sklearn.utils.extmath import randomized_svd
 from sklearn.decomposition import TruncatedSVD
 from sklearn.preprocessing import normalize
+
+
+def ensure_nltk_resources():
+    """Download the small tokenizer/stopword resources if they are missing."""
+    resources = (
+        ('tokenizers/punkt', 'punkt'),
+        ('tokenizers/punkt_tab', 'punkt_tab'),
+        ('corpora/stopwords', 'stopwords'),
+    )
+    for resource_path, package_name in resources:
+        try:
+            nltk.data.find(resource_path)
+        except LookupError:
+            nltk.download(package_name, quiet=True)
+
+
+@lru_cache(maxsize=1)
+def english_stopword_set():
+    return set(stopwords.words('english'))
+
+
+ensure_nltk_resources()
 
 
 def clean_and_filter_tokens(line):
@@ -62,7 +67,7 @@ def clean_and_filter_tokens(line):
             continue
 
         # Skip NLTK's English stopwords
-        if t_lower in stopwords.words('english'):
+        if t_lower in english_stopword_set():
             continue
 
         tokens.append(t_lower)
@@ -218,6 +223,10 @@ def save_word_vectors(file_name, word_vector_matrix, word_to_id, vocab,
     if verbose:
         print(f"Saving word vectors for {len(vocab)} words:")
 
+    output_dir = os.path.dirname(file_name)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     with open(file_name, "w", encoding='utf-8') as vector_file:
         vector_file.write(f"{word_vector_matrix.shape[0]} {word_vector_matrix.shape[1]}\n")
 
@@ -295,11 +304,20 @@ def multiply_by_columns(matrix, col_coefs):
     return matrix.dot(normalizer.tocsr())
 
 
+def svd_components(matrix, requested_dimensions, verbose=True):
+    max_components = min(matrix.shape)
+    if max_components < 1:
+        raise ValueError("The co-occurrence matrix is empty; check the corpus and min_count.")
+    components = min(requested_dimensions, max_components)
+    if verbose and components != requested_dimensions:
+        print(f"Using {components} SVD components because the matrix is {matrix.shape}.")
+    return components
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Calculates word embeddings '
                                                  'from corpus using PPMI, SVD, '
-                                                 'and Dirichlet smoothing. Cf. '
-                                                 'Jungmaier/Kassner/Roth (2020).')
+                                                 'and Dirichlet smoothing.')
     parser.add_argument('corpus_file',
                         help='Text file with lines of raw text. Tokenization '
                              'and stopword removal done with NLTK.')
@@ -348,6 +366,8 @@ if __name__ == "__main__":
     )
 
     # 3) SVD
+    dimensions = svd_components(m, args.dimensions, verbose=args.verbose)
+
     if args.verbose:
         print("Performing SVD...", end="\r")
 
@@ -356,16 +376,16 @@ if __name__ == "__main__":
 
     if args.eigenvalue_weighting == 1:
         # Full SVD with Sigma in final vectors
-        svd = TruncatedSVD(n_components=args.dimensions, random_state=0)
+        svd = TruncatedSVD(n_components=dimensions, random_state=0)
         m = svd.fit_transform(m)
     elif args.eigenvalue_weighting == 0:
         # Standard truncated SVD ignoring singular values
-        u, _, _ = randomized_svd(m, n_components=args.dimensions,
+        u, _, _ = randomized_svd(m, n_components=dimensions,
                                  random_state=0)
         m = u
     else:
         # Weighted by s^alpha
-        u, s, _ = randomized_svd(m, n_components=args.dimensions,
+        u, s, _ = randomized_svd(m, n_components=dimensions,
                                  random_state=0)
         sigma = np.diag(s ** args.eigenvalue_weighting)
         m = u.dot(sigma)

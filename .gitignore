@@ -1,0 +1,23 @@
+# Python cache and environment files
+__pycache__/
+*.py[cod]
+.Python
+.venv/
+venv/
+env/
+
+# Project-local data and helper artifacts
+datasets/
+utils/
+average_calc.docx
+
+# Generated experiment artifacts
+outputs/
+results/
+spearman_correlation_*_avg.png
+
+# Local logs and scratch files
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
